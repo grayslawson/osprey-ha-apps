@@ -1,0 +1,39 @@
+name: Sync the add-on
+
+# Home Assistant reads an app repository from the root of a Git repository, so
+# the add-on lives in this repository rather than in the Osprey repository.
+# The mirror is refreshed on a schedule and on demand; a release does not
+# have to publish here, because the add-on image is built by the Osprey
+# release workflow and pulled by the pinned tag in config.yaml.
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: grayslawson/osprey
+          path: upstream
+          ref: main
+      - name: Mirror the add-on and the application source
+        run: upstream/scripts/sync-ha-apps.sh upstream .
+      - name: Commit the mirror
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'The add-on is already up to date.'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'chore: sync the Osprey add-on'
+          git push
