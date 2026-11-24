@@ -22,10 +22,12 @@ import json
 import logging
 import math
 import re
+import secrets
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator
+from collections.abc import Set as AbstractSet
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -34,6 +36,8 @@ from typing import TYPE_CHECKING, Final
 from urllib.parse import parse_qs, quote, unquote
 
 import arbitration
+from firmware import firmware_status
+from onboarding import Onboarding, OnboardingError
 import ptz
 import websecurity
 from model import Camera, Position
@@ -50,6 +54,8 @@ STATIC_PREFIX: Final = "/ui/"
 WEB_ROOT: Final = Path(__file__).resolve().parent / "web"
 DEFAULT_CAMERA: Final = "default"
 MAX_JSON_BYTES: Final = 4096
+# Changes on every start, so the setup wizard can tell when Osprey has restarted.
+BOOT_ID: Final = secrets.token_hex(8)
 MAX_SSE_CLIENTS: Final = 16
 MAX_THUMBNAILS: Final = 64
 MAX_THUMBNAIL_BYTES: Final = 2 * 1024 * 1024
@@ -145,7 +151,7 @@ def ptz_state(camera: Camera | None, *, enabled: bool = True) -> dict[str, objec
         "error": error,
         "available": camera.motion.available,
         "position": _normalised(camera, position),
-        "raw": {"pan": position.pan, "tilt": position.tilt, "zoom": position.zoom},
+        "raw": {"pan": position.pan, "tilt": position.tilt, "zoom": position.zoom, "focus": position.focus},
         "updated_at": round(camera.motion.updated_at, 3),
         "fov_calibrated": camera.field_of_view is not None,
     }
@@ -189,6 +195,9 @@ def health_checks(services: "Services") -> list[dict[str, object]]:
         check("adoption", "Camera adoption", "warn", "Waiting for the camera to connect and adopt.")
     else:
         check("adoption", "Camera adoption", "ok", f"{camera.name or camera.mac} is adopted.")
+    if camera is not None and camera.adopted:
+        fw_status, fw_message = firmware_status(camera.firmware)
+        check("firmware", "Camera firmware", "ok" if fw_status == "tested" else "warn", fw_message)
     if camera is not None and camera.is_ptz:
         state = ptz_state(camera)
         error = state.get("error")
@@ -266,6 +275,42 @@ def health_checks(services: "Services") -> list[dict[str, object]]:
     return checks
 
 
+DOCS_URL: Final = "https://github.com/grayslawson/osprey/blob/main/docs/"
+
+
+def setup_checks(services: "Services", onboarding: Onboarding) -> list[dict[str, object]]:
+    """The wizard's last step: the four things that must work, each with its help page."""
+    health = {str(c["id"]): c for c in health_checks(services)}
+    checks: list[dict[str, object]] = []
+
+    def check(identifier: str, label: str, ok: bool | None, detail: str, help_page: str) -> None:
+        checks.append({"id": identifier, "label": label, "detail": detail,
+                       "status": "skip" if ok is None else "ok" if ok else "bad",
+                       "help": DOCS_URL + help_page if ok is False else ""})
+
+    adoption = health.get("adoption", {})
+    adopted = adoption.get("status") == "ok"
+    connected = services.backend.camera_connected()
+    check("adoption", "Camera adopted", adopted, str(adoption.get("detail", "")),
+          "troubleshooting.md#the-camera-connects-but-adoption-does-not-finish" if connected
+          else "troubleshooting.md#the-camera-never-connects")
+    tracks = [c for key, c in health.items() if key.startswith("track:")]
+    playing = [str(c["label"]).removeprefix("Stream ") for c in tracks if c["status"] == "ok"]
+    check("video", "Video flowing", bool(playing),
+          f"Playable: {', '.join(playing)}." if playing else "No track has delivered a decodable keyframe yet.",
+          "troubleshooting.md#no-video")
+    onvif_ok, onvif_detail = onboarding.onvif_check()
+    check("onvif", "ONVIF reachable", onvif_ok, onvif_detail,
+          "troubleshooting.md#frigate-gets-401-or-cannot-connect-after-an-upgrade")
+    url = services.frigate_url
+    if url:
+        frigate_ok, frigate_detail = onboarding.frigate_check(url)
+        check("frigate", "Frigate connected", frigate_ok, frigate_detail, "frigate-integration.md#check-the-connection")
+    else:
+        check("frigate", "Frigate connected", None, "No Frigate URL configured; skipped.", "")
+    return checks
+
+
 def preset_list(camera: Camera | None, thumbs: Callable[[int], bool]) -> list[dict[str, object]]:
     if camera is None:
         return []
@@ -312,6 +357,8 @@ class WebApp:
         # else a position poll is requested (a fresh motor reply clears the
         # timeout state).
         self.recover_hook: Callable[["Services"], tuple[bool, str]] | None = None
+        # The wizard's post-save steps (``/api/v1/setup/...``); set by the daemon.
+        self.onboarding: Onboarding | None = None
 
     def close(self) -> None:
         self._stopping.set()
@@ -391,6 +438,9 @@ class WebApp:
         if path == "/sentry" and method == "GET":
             self._send_json(h, HTTPStatus.OK, self.sentry_overview())
             return
+        if path.startswith("/setup/"):
+            self._setup_route(h, method, path, request.query)
+            return
         match = re.fullmatch(r"/cameras/([^/]+)(/.*)?", path)
         if not match:
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "no such API resource")
@@ -421,6 +471,8 @@ class WebApp:
             return
         elif rest == "/ptz/move" and method == "POST":
             status, result = self.ptz_move(services, body())
+        elif rest == "/isp" and method == "POST":
+            status, result = self.isp_apply(services, body())
         elif rest == "/ptz/center" and method == "POST":
             status, result = self.ptz_center(services, body())
         elif rest == "/ptz/stop" and method == "POST":
@@ -487,6 +539,32 @@ class WebApp:
             else:
                 raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "no such camera resource")
         self._send_json(h, status, result)
+
+    # ------------------------------------------------------------------ setup
+
+    def _setup_route(self, h: "_Handler", method: str, path: str, query: dict[str, list[str]]) -> None:
+        onboarding = self.onboarding
+        if onboarding is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "setup steps are not available here")
+        try:
+            if path == "/setup/status" and method == "GET":
+                result = onboarding.status(self.server.services.frigate_url)
+            elif path == "/setup/adopt" and method == "POST":
+                result = onboarding.adopt(self._read_json(h))
+            elif path == "/setup/frigate" and method == "GET":
+                named: dict[str, object] = {"name": query["name"][0]} if query.get("name") else {}
+                result = {**onboarding.frigate_block(named), "frigate_url": self.server.services.frigate_url or ""}
+            elif path == "/setup/checks" and method == "GET":
+                result = {"checks": setup_checks(self.server.services, onboarding)}
+            elif path == "/setup/frigate/preview" and method == "POST":
+                result = onboarding.frigate_preview(self._read_json(h), self.server.services.frigate_url)
+            elif path == "/setup/frigate/apply" and method == "POST":
+                result = onboarding.frigate_apply(self._read_json(h), self.server.services.frigate_url)
+            else:
+                raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "no such setup step")
+        except OnboardingError as exc:
+            raise ApiError(HTTPStatus(exc.status), exc.code, str(exc)) from None
+        self._send_json(h, HTTPStatus.OK, result)
 
     # ----------------------------------------------------------------- sentry
 
@@ -564,7 +642,7 @@ class WebApp:
         for index, item in enumerate(value):
             if not isinstance(item, dict):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid", f"points[{index}] must be an object")
-            unknown = set(item) - {"name", "dwell_sec"}
+            unknown = set(item) - {"name", "dwell_sec", "night_preset"}
             if unknown:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "invalid",
                                f"points[{index}] has unexpected field(s): {', '.join(sorted(unknown))}")
@@ -580,7 +658,13 @@ class WebApp:
                 if not 1 <= float(dwell) <= 86400:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "invalid",
                                    f"points[{index}].dwell_sec must be between 1 and 86400")
-            points.append({"name": name.strip(), "dwell_sec": None if dwell is None else float(dwell)})
+            night = item.get("night_preset")
+            if night is not None and (not isinstance(night, str) or not night.strip()
+                                      or len(night) > _PRESET_NAME_MAX):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid",
+                               f"points[{index}].night_preset must be 1-{_PRESET_NAME_MAX} characters")
+            points.append({"name": name.strip(), "dwell_sec": None if dwell is None else float(dwell),
+                           **({"night_preset": night.strip()} if night else {})})
         return points
 
     # ----------------------------------------------------------- cameras
@@ -641,6 +725,7 @@ class WebApp:
                 **self._camera_summary(camera_id, services),
                 "mac": camera.mac,
                 "firmware": camera.firmware,
+                "firmware_status": firmware_status(camera.firmware)[0],
                 "tracks": tracks,
             },
             "ptz": ptz_state(camera, enabled=services.ptz_enabled),
@@ -675,7 +760,7 @@ class WebApp:
         return camera
 
     @staticmethod
-    def _fields(data: object, allowed: set[str], required: set[str] = set()) -> dict[str, object]:
+    def _fields(data: object, allowed: set[str], required: AbstractSet[str] = frozenset()) -> dict[str, object]:
         if not isinstance(data, dict):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid", "expected a JSON object")
         unknown = set(data) - allowed
@@ -798,6 +883,21 @@ class WebApp:
         else:
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid", "mode must be relative, absolute or continuous")
         return self._dispatch(services, target, speed)
+
+    def isp_apply(self, services: "Services", data: object) -> tuple[HTTPStatus, dict[str, object]]:
+        """Send ChangeIspSettings fields to the camera (focus mode, IR, exposure...)."""
+        settings = self._isp_settings(data)
+        self._ptz_camera(services)
+        return HTTPStatus.OK, {"acked": services.backend.change_isp(settings)}
+
+    @staticmethod
+    def _isp_settings(data: object) -> dict[str, object]:
+        if not isinstance(data, dict) or len(data) > 32:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid", "expected a JSON object of ISP settings")
+        for key, value in data.items():
+            if not isinstance(value, (str, int, float, bool)) or not re.fullmatch(r"[A-Za-z0-9]{1,40}", key):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid", f"bad ISP setting {key!r}")
+        return data
 
     def ptz_center(self, services: "Services", data: object) -> tuple[HTTPStatus, dict[str, object]]:
         fields = self._fields(data, {"x", "y", "zoom"}, {"x", "y"})
@@ -988,6 +1088,7 @@ class WebApp:
             "principal": kind,
             "csrf": principal[1] if principal is not None else None,
             "ingress": bool(websecurity.ingress_prefix(h.headers)),
+            "boot": BOOT_ID,
         }
 
     def _login(self, h: "_Handler") -> None:

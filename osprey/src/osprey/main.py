@@ -37,12 +37,16 @@ import events
 import identity
 import media
 import mqtt_bridge
+import onboarding
 import onvif
 import logbuffer
 import logfile
 import rtsp
 import snapshots
+import secure_defaults
 import setup_wizard
+from version import get_version
+from firmware import firmware_status
 from controller import CONTROL_PORT, Controller, PtzWatchdog, normalise_mac
 from presets import PresetStore
 from unifiwire.envelope import Envelope
@@ -97,6 +101,8 @@ class Options:
     discovery_address: str | None = None
     hello_interval: float = 300.0
     discovery_scopes: tuple[str, ...] = ()
+    # "legacy" keeps the old open defaults; resolve_options sets "secure" for a new install.
+    security: str = "legacy"
 
 
 @dataclass
@@ -193,9 +199,8 @@ def resolve_options(args: argparse.Namespace) -> Options:
     setup_wizard.load_environment(
         os.environ.get("OSPREY_SECRETS_FILE") or str(Path(path).parent / "osprey-secrets.env")
     )
-    setup_mode = bool(getattr(args, "setup", False)) or os.environ.get("OSPREY_SETUP") == "1"
-    if args.config and not os.path.exists(path) and not setup_mode:
-        raise SystemExit(f"config file not found: {path}")
+    setup_env = os.environ.get("OSPREY_SETUP", "").strip().lower()
+    setup_mode = bool(getattr(args, "setup", False)) or setup_env == "1"
     try:
         effective = config.merged(config.load(path))
     except (OSError, ValueError) as exc:  # JSONDecodeError is a ValueError
@@ -212,7 +217,7 @@ def resolve_options(args: argparse.Namespace) -> Options:
         try:
             effective.setdefault("ptz", {})["max_speed"] = int(os.environ["OSPREY_PTZ_MAX_SPEED"])
         except ValueError:
-            raise SystemExit("invalid runtime configuration: OSPREY_PTZ_MAX_SPEED must be an integer")
+            raise SystemExit("invalid runtime configuration: OSPREY_PTZ_MAX_SPEED must be an integer") from None
     if args.name is not None:
         effective["name"] = args.name
     if args.cert is not None:
@@ -235,8 +240,19 @@ def resolve_options(args: argparse.Namespace) -> Options:
         if flag is not None:
             ports[key] = flag
 
+    explicit_host = args.host or os.environ.get("OSPREY_HOST")
+    if not config_had_host and not setup_mode and setup_env not in ("0", "false", "no", "off"):
+        # First run opens the wizard by itself: nothing names a host, or a host is
+        # given but the state directory is new (or holds an unfinished wizard).
+        setup_mode = (
+            not explicit_host
+            or not Path(effective["cert"]).exists()
+            or (Path(path).parent / setup_wizard.PENDING_MARKER).exists()
+        )
+    if args.config and not os.path.exists(path) and not setup_mode:
+        raise SystemExit(f"config file not found: {path}")
     if not config_had_host and setup_mode:
-        effective["host"] = args.host or os.environ.get("OSPREY_HOST") or "127.0.0.1"
+        effective["host"] = explicit_host or setup_wizard.detect_lan_ip() or "127.0.0.1"
     try:
         config.validate_runtime(effective)
     except ValueError as exc:
@@ -276,7 +292,9 @@ def resolve_options(args: argparse.Namespace) -> Options:
         hello_interval = float(discovery_settings.get("hello_interval", 300))
     except (TypeError, ValueError) as exc:
         raise SystemExit(f"invalid runtime configuration: {exc}") from exc
+    cert_path = Path(effective["cert"])
     return Options(
+        security=secure_defaults.resolve(cert_path.parent, (cert_path, Path(path))),
         host=effective["host"],
         bind_host=str(effective.get("bind") or os.environ.get("OSPREY_BIND") or "0.0.0.0"),
         cert=Path(effective["cert"]),
@@ -355,6 +373,7 @@ def build(options: Options) -> Stack:
     # the TLS control channel. An empty set preserves discovery for deployments
     # where the camera receives a dynamic address; those deployments must use a
     # firewall or VLAN boundary (see docs/security.md).
+    secure = options.security == "secure"
     allowed_camera_peers: set[str] = set()
     for item in options.cameras:
         camera_ip = item.get("ip")
@@ -363,20 +382,29 @@ def build(options: Options) -> Stack:
     if options.expected_camera_ip:
         allowed_camera_peers.add(options.expected_camera_ip)
 
+    # Secure installs enforce the list even while empty: the first camera that
+    # completes the control handshake adds its IP (controller.learned_peers).
+    # Legacy installs without a configured IP stay open, as before.
+    state_dir = options.cert.parent
+    learn = secure and not allowed_camera_peers
+    camera_peers: set[str] | None = allowed_camera_peers if (allowed_camera_peers or secure) else None
+    if camera_peers is None:
+        log.warning("media and snapshot ports accept any LAN host; set cameras[].ip or --expected-camera-ip")
+
     # Listeners first: every URL we hand out has to name the port actually bound,
     # not the one asked for. They differ whenever a port is left to the system.
     ingest = media.IngestServer(
         hub,
         port=options.ingest_port,
         fallback_name=options.tracks[0] if options.tracks else "video1",
-        allowed_peers=allowed_camera_peers,
+        allowed_peers=camera_peers,
         bind_host=options.bind_host,
     )
     ingest_port = int(ingest.server_address[1])
     images = snapshots.Store("https://placeholder")  # rewritten below, once bound
     uploads = snapshots.SnapshotServer(
         images, cert=options.cert, port=options.snapshot_port,
-        allowed_peers=allowed_camera_peers,
+        allowed_peers=camera_peers,
         bind_host=options.bind_host,
     )
     snapshot_port = int(uploads.server_address[1])
@@ -393,6 +421,20 @@ def build(options: Options) -> Stack:
         raise ValueError("OSPREY_RTSP_USERNAME and RTSP password must be configured together")
     # One credential store for ONVIF, snapshots and (opt-in) RTSP.
     onvif_auth = onvif.OnvifAuth.from_environment()
+    if secure and not onvif_auth.configured and os.environ.get("OSPREY_ONVIF_AUTH") != "disabled":
+        onvif_password = secure_defaults.credential(state_dir, "onvif")
+        onvif_auth = onvif.OnvifAuth(
+            secure_defaults.username(state_dir, "onvif"), onvif_password,
+            users=onvif_auth.directory,
+        )
+    if secure and not rtsp_user and not onvif_auth.directory.rtsp_require_auth \
+            and os.environ.get("OSPREY_RTSP_AUTH") != "disabled":
+        rtsp_user = secure_defaults.USERNAME
+        rtsp_password = secure_defaults.credential(state_dir, "rtsp")
+    if not secure and not onvif_auth.configured:
+        log.warning("ONVIF is anonymous: anyone on the network can move the camera; enable auth (docs/security.md)")
+    if not secure and not rtsp_user and not onvif_auth.directory.rtsp_require_auth:
+        log.warning("RTSP is anonymous: anyone on the network can watch the camera")
     directory = onvif_auth.directory
     rtsp_auth: rtsp.RtspAuth | None = None
     if rtsp_user or directory.rtsp_require_auth:
@@ -419,7 +461,9 @@ def build(options: Options) -> Stack:
         expected_camera_mac=options.expected_camera_mac,
         configured_cameras={str(item["mac"]): item for item in options.cameras},
         bind_host=options.bind_host,
+        learned_peers=camera_peers if learn else None,
         preset_store=PresetStore(preset_path(options)),
+        isp_baseline=options.ptz.get("isp_baseline"),
         auto_home=bool(options.ptz.get("auto_home", True)),
         watchdog=PtzWatchdog(
             reply_timeout_sec=float(options.ptz.get("reply_timeout_sec", 30.0)),
@@ -490,6 +534,7 @@ def build(options: Options) -> Stack:
         gate=movement_gate,
         preset_names=sentry_presets,
         store=SentryStore(options.cert.parent / "sentry.json"),
+        is_night=lambda mac: getattr(control.cameras.get(mac), "scene", None) == "NIGHT",
     )
     # The config file is the baseline; the state file holds whatever an
     # operator changed at runtime, so a restart does not drop a running patrol.
@@ -587,6 +632,10 @@ def build(options: Options) -> Stack:
             mac = selected_mac()
             return control.set_preset(mac, name, index) if mac else None
 
+        def selected_change_isp(settings: dict[str, Any]) -> bool | None:
+            mac = selected_mac()
+            return control.change_isp(mac, settings) if mac else False
+
         def selected_remove(index: int) -> bool:
             mac = selected_mac()
             return control.remove_preset(mac, index) if mac else False
@@ -651,6 +700,7 @@ def build(options: Options) -> Stack:
             goto_preset=selected_goto,
             set_preset=selected_set,
             remove_preset=selected_remove,
+            change_isp=selected_change_isp,
             refresh_position=selected_refresh,
             stop=selected_stop,
             move_refusal=selected_refusal,
@@ -675,6 +725,17 @@ def build(options: Options) -> Stack:
         secrets_path=os.environ.get("OSPREY_SECRETS_FILE"),
         frigate_path=os.environ.get("OSPREY_FRIGATE_CONFIG_FILE"),
     ) if options.setup_mode else None
+    if setup is not None:
+        bracketed = f"[{options.host}]" if ":" in options.host else options.host
+        setup.defaults = {
+            "host": options.host,
+            "bind": options.bind_host,
+            "bridge_hint": setup_wizard.bridge_hint(options.host),
+        }
+        try:
+            (options.config_path.parent / setup_wizard.PENDING_MARKER).touch()
+        except OSError as exc:
+            log.debug("cannot mark setup pending: %s", exc)
     interface_hw = (
         identity.interface_mac(options.discovery_interface) if options.discovery_interface else None
     )
@@ -697,13 +758,19 @@ def build(options: Options) -> Stack:
         log_calls=bool(options.onvif_log_calls),
     )
     north = onvif.OnvifServer(services, port=options.onvif_port, registry=registry, bind_host=options.bind_host)
+    north.web.onboarding = onboarding.Onboarding(
+        host=options.host, control_port=options.control_port, cameras=options.cameras,
+        rtsp_port=stream.port, onvif_port=north.port,
+        rtsp_login=(rtsp_user, rtsp_password) if rtsp_user and rtsp_password else None,
+        onvif_login=(onvif_auth.username, onvif_auth.password)
+        if onvif_auth.username and onvif_auth.password else None,
+        state_dir=options.config_path.parent,
+    )
     # The service addresses it advertises must match where it is really listening.
     services.port = north.port
     if setup is not None:
-        log.warning(
-            "first-run setup pending; open http://%s:%d/setup and use setup token: %s",
-            options.host, north.port, setup.token,
-        )
+        setup.url = f"http://{bracketed}:{north.port}/setup"
+        setup.announce()
     read_only_north: onvif.OnvifServer | None = None
     if options.onvif_read_only_port is not None:
         read_only_services = onvif.Services(
@@ -856,6 +923,9 @@ def build(options: Options) -> Stack:
                 "FOV-relative moves are off. Run `osprey probe` and open a model-support issue.",
                 camera.mac, camera.model or "?",
             )
+        fw_status, fw_message = firmware_status(camera.firmware)
+        if fw_status != "tested":
+            log.warning("camera %s: %s", camera.mac, fw_message)
         # Re-announce now that we know whether to claim PTZ.
         finder.identities = advertised(camera.name or options.name, camera.is_ptz)
         if options.announce:
@@ -929,7 +999,8 @@ def build(options: Options) -> Stack:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Present a UniFi camera as an ONVIF device.")
+    parser = argparse.ArgumentParser(prog="osprey", description="Present a UniFi camera as an ONVIF device.")
+    parser.add_argument("--version", action="version", version=f"osprey {get_version()}")
     # Overridable settings default to None so the config file shows through when a
     # flag is omitted; a flag that is given always wins. See resolve_options().
     parser.add_argument("--config", default=None,
@@ -974,6 +1045,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if (sys.argv[1:] if argv is None else argv) == ["version"]:
+        print(get_version())
+        return 0
     args = parse_args(argv)
     # Configure the deployment's stderr/journal first, then attach the bounded
     # redacted tail used by the authenticated operator console.  ``basicConfig``
@@ -987,6 +1061,17 @@ def main(argv: list[str] | None = None) -> int:
 
     options = resolve_options(args)
     stack = build(options)
+    restart = threading.Event()
+    if stack.services.setup is not None:
+        def apply_setup() -> None:
+            # Let the browser receive the save response, then restart onto the new config.
+            def stop() -> None:
+                restart.set()
+                stack.controller.stop()
+            timer = threading.Timer(1.0, stop)
+            timer.daemon = True
+            timer.start()
+        stack.services.setup.on_complete = apply_setup
     # Persist a rotating log next to the certificate so a restart keeps a
     # short history.  A read-only or missing state directory only disables the
     # file log; the controller still runs with console logging.
@@ -994,14 +1079,11 @@ def main(argv: list[str] | None = None) -> int:
         options.cert.parent,
         level=logging.DEBUG if args.verbose else logging.INFO,
     )
-    stopping = threading.Event()
 
     def shutdown(signum: int, frame: FrameType | None) -> None:
-        if stopping.is_set():
-            return
-        stopping.set()
-        log.info("stopping")
-        stack.stop()
+        # Only flag the stop: the control loop notices it, run() returns, and
+        # the teardown below runs on the main thread outside the signal context.
+        stack.controller.stop()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -1011,8 +1093,25 @@ def main(argv: list[str] | None = None) -> int:
         options.control_port, options.ingest_port, options.snapshot_port,
         options.rtsp_port, options.onvif_port, onvif.DEVICE_PATH,
     )
-    stack.run()
+    try:
+        stack.run()
+    finally:
+        log.info("stopping")
+        stack.stop()
+    if restart.is_set():
+        reexec()
     return 0
+
+
+def reexec() -> None:
+    """Replace this process with a fresh copy that reads the saved configuration.
+
+    ``sys.orig_argv`` keeps ``-m`` and the original script, whichever launcher
+    started us; listening sockets are not inheritable, so the ports are free.
+    """
+    log.warning("setup saved; restarting with the new configuration")
+    logging.shutdown()
+    os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
 
 
 if __name__ == "__main__":

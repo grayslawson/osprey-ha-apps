@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections.abc import Mapping
-from typing import Callable, ClassVar, Final, TYPE_CHECKING
+from typing import Any, Callable, ClassVar, Final, TYPE_CHECKING
 from xml.etree import ElementTree
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -52,6 +52,7 @@ from principals import (
 )
 from snapshots import SnapshotCache
 from logbuffer import BUFFER, LogBuffer
+import camera_finder
 import websecurity
 from setup_wizard import SetupError, SetupManager
 
@@ -89,6 +90,7 @@ FRIGATE_API_PATH: Final = "/api/frigate"
 LOGS_API_PATH: Final = "/api/logs"
 SETUP_PATH: Final = "/setup"
 SETUP_API_PATH: Final = "/api/setup"
+SETUP_DISCOVER_PATH: Final = "/api/setup/discover"
 SESSION_COOKIE: Final = "osprey_session"
 LEGACY_PATH: Final = "/legacy"
 CSRF_FIELD: Final = "csrf"
@@ -168,9 +170,10 @@ class AdminAuth:
                 "use this only for local development", mode,
             )
         elif not encoded:
-            log.error(
-                "operator console is locked: configure OSPREY_ADMIN_PASSWORD_HASH or "
-                "OSPREY_ADMIN_PASSWORD_FILE (or OSPREY_ADMIN_AUTH=disabled for development)"
+            log.warning(
+                "operator console is locked until an admin password is set: finish the "
+                "first-run setup at /setup, or configure OSPREY_ADMIN_PASSWORD_HASH or "
+                "OSPREY_ADMIN_PASSWORD_FILE (OSPREY_ADMIN_AUTH=disabled is for development only)"
             )
         return cls(encoded, allow_anonymous=anonymous, trusted_ingress_peer=trusted_peer)
 
@@ -558,6 +561,8 @@ class Backend:
     goto_preset: Callable[[int, int], bool] = lambda _i, _s: False
     set_preset: Callable[[str, int | None], int | None] = lambda _n, _i: None
     remove_preset: Callable[[int], bool] = lambda _i: False
+    # One ChangeIspSettings request on the control channel: True ack, False refused, None silent.
+    change_isp: Callable[[dict[str, Any]], bool | None] = lambda _s: False
     refresh_position: Callable[[], bool] = lambda: False
     # Halt the head: (pan_tilt, zoom) -> whether a stop was issued or not needed.
     stop: Callable[[bool, bool], bool] = lambda _pt, _z: False
@@ -2854,7 +2859,7 @@ class Services:
             "http://www.onvif.org/onvif/ver10/topics/topicns.xml"
             "</tev:TopicNamespaceLocation>"
             "<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>"
-            f"<wstop:TopicSet xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\">"
+            "<wstop:TopicSet xmlns:wstop=\"http://docs.oasis-open.org/wsn/t-1\">"
             "<tns1:RuleEngine><CellMotionDetector><Motion wstop:topic=\"true\"/>"
             "</CellMotionDetector><MyRuleDetector>"
             "<PeopleDetect wstop:topic=\"true\"/><VehicleDetect wstop:topic=\"true\"/>"
@@ -3060,14 +3065,18 @@ class _Handler(BaseHTTPRequestHandler):
             return
         root = selected_root
         if root == SETUP_PATH:
-            if (
-                self.services.read_only
-                or self.services.setup is None
-                or not self.services.setup.pending
-            ):
+            pending = self.services.setup is not None and self.services.setup.pending
+            # After the save an admin returns here for the remaining steps (adopt, Frigate, checks).
+            if self.services.read_only or not (pending or self._session() is not None):
                 self._send(HTTPStatus.NOT_FOUND, b"setup is unavailable", "text/plain")
                 return
             self._setup_page()
+            return
+        if root == SETUP_API_PATH:
+            if self.services.read_only or self.services.setup is None or not self.services.setup.pending:
+                self._send(HTTPStatus.NOT_FOUND, b'{"error":"setup is unavailable"}', "application/json")
+                return
+            self._setup_status()
             return
         if root == LOGIN_PATH:
             self._login_page()
@@ -3227,15 +3236,19 @@ class _Handler(BaseHTTPRequestHandler):
         if selected_root is None:
             return
         root = selected_root
-        if root == SETUP_API_PATH:
+        if root in (SETUP_API_PATH, SETUP_DISCOVER_PATH):
             if (
                 self.services.read_only
                 or self.services.setup is None
                 or not self.services.setup.pending
             ):
+                self._drain()
                 self._send(HTTPStatus.NOT_FOUND, b"setup is unavailable", "text/plain")
                 return
-            self._setup_submit()
+            if root == SETUP_API_PATH:
+                self._setup_submit()
+            else:
+                self._setup_discover()
             return
         if root == LOGIN_PATH:
             self._login()
@@ -3349,43 +3362,42 @@ class _Handler(BaseHTTPRequestHandler):
                 return False
         return True
 
-    def _setup_page(self, error: str = "") -> None:
-        """Render the unauthenticated, token-gated first-run wizard."""
-        setup = self.services.setup
-        if setup is None or not setup.pending:
-            self._send(HTTPStatus.NOT_FOUND, b"setup is unavailable", "text/plain")
+    def _setup_trusted(self) -> bool:
+        """Home Assistant ingress has already signed its user in; no token needed there."""
+        peer = self.client_address[0] if self.client_address else ""
+        trusted = self.services.auth.trusted_ingress_peer
+        return bool(trusted and peer == trusted and websecurity.ingress_prefix(self.headers))
+
+    def _setup_page(self) -> None:
+        """Serve the wizard; its script reads the token from the link and calls the API."""
+        try:
+            body = (Path(__file__).resolve().parent / "web" / "setup.html").read_bytes()
+        except OSError:
+            self._send(HTTPStatus.INTERNAL_SERVER_ERROR, b"setup page is missing", "text/plain")
             return
-        message = f"<p class='error'>{html.escape(error)}</p>" if error else ""
-        body = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                "<title>Set up Osprey</title><style>body{font:16px system-ui;max-width:48rem;margin:5vh auto;padding:1.5rem;background:#101820;color:#eef}"
-                "fieldset{border:1px solid #38505e;border-radius:10px;margin:1rem 0;padding:1rem}label{display:block;margin:.7rem 0}"
-                "input,button{font:inherit;padding:.65rem;width:100%;box-sizing:border-box}input{background:#182631;color:#fff;border:1px solid #536b78;border-radius:5px}"
-                "button{background:#6ee7b7;border:0;border-radius:5px;font-weight:700;cursor:pointer}.error{color:#fca5a5}.hint{color:#a7bac5;font-size:.88rem}"
-                ".credentials{white-space:pre-wrap;background:#0b1118;padding:1rem;border-radius:6px;display:none}</style>"
-                "<h1>Set up Osprey</h1><p class='hint'>This one-time wizard creates the controller configuration and deployment secrets."
-                " Copy the setup token from the Osprey startup log before submitting.</p>"
-                f"{message}<form id='setup-form' method='post' action='/api/setup'><fieldset><legend>Network</legend>"
-                "<label>Advertised host <input name='host' required placeholder='osprey.example.lan'></label>"
-                "<label>Bind address <input name='bind' value='0.0.0.0' required></label></fieldset>"
-                "<fieldset><legend>Camera</legend>"
-                "<label>Name <input name='name' required placeholder='Driveway PTZ'></label>"
-                "<label>Protect MAC address <input name='mac' required placeholder='AA:BB:CC:DD:EE:FF'></label>"
-                "<label>Camera IP address <input name='ip' required placeholder='192.0.2.20'></label></fieldset>"
-                "<fieldset><legend>Frigate and access</legend>"
-                "<label>Frigate URL <input name='frigate_url' type='url' required placeholder='http://frigate:5000'></label>"
-                "<label>Admin password <input name='admin_password' type='password' minlength='8' required autocomplete='new-password'></label>"
-                "<label>Setup token <input name='setup_token' type='password' required autocomplete='off'></label></fieldset>"
-                "<button type='submit'>Save configuration</button></form><p id='result' class='hint'></p>"
-                "<pre id='credentials' class='credentials'></pre><script>"
-                "const form=document.getElementById('setup-form'),result=document.getElementById('result'),out=document.getElementById('credentials');"
-                "form.onsubmit=async e=>{e.preventDefault();result.textContent='Saving…';const data=Object.fromEntries(new FormData(form));"
-                "try{const r=await fetch('/api/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});"
-                "const j=await r.json();if(!r.ok)throw Error(j.error||'setup failed');result.textContent='Saved. Restart Osprey to apply the configuration.';"
-                "out.textContent='Save these generated credentials now; they are shown only once.\\n\\n'+Object.entries(j.generated_credentials||{}).map(([k,v])=>k+'='+v).join('\\n');out.style.display='block';form.querySelector('button').disabled=true;"
-                "}catch(err){result.textContent=err.message}};</script>")
-        # Inline script and style, like /login; method=post keeps the password
-        # out of the URL even if the script never runs.
-        self._send(HTTPStatus.OK, body.encode(), "text/html; charset=utf-8", legacy=True)
+        self._send(HTTPStatus.OK, body, "text/html; charset=utf-8", headers=(("Cache-Control", "no-store"),))
+
+    def _setup_status(self) -> None:
+        setup = self.services.setup
+        assert setup is not None
+        try:
+            setup.check_token(self.headers.get("X-Setup-Token", ""), trusted=self._setup_trusted())
+        except SetupError as exc:
+            self._send(HTTPStatus.FORBIDDEN, json.dumps({"error": str(exc)}).encode(), "application/json")
+            return
+        body = {**setup.status(), "port": self.services.port, "ingress": self._setup_trusted()}
+        self._send(HTTPStatus.OK, json.dumps(body).encode(), "application/json", headers=(("Cache-Control", "no-store"),))
+
+    def _setup_payload(self) -> dict[str, object]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length < 1 or length > 16 * 1024:
+            raise SetupError("invalid request size")
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise SetupError("Content-Type must be application/json")
+        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise SetupError("setup payload must be an object")
+        return payload
 
     def _setup_submit(self) -> None:
         setup = self.services.setup
@@ -3393,20 +3405,42 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.NOT_FOUND, b'{"error":"setup is unavailable"}', "application/json")
             return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length < 1 or length > 16 * 1024:
-                raise SetupError("invalid request size")
-            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                raise SetupError("Content-Type must be application/json")
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise SetupError("setup payload must be an object")
+            payload = self._setup_payload()
             token = self.headers.get("X-Setup-Token", "") or str(payload.pop("setup_token", ""))
-            result = setup.save(payload, token)
+            result = setup.save(payload, token, trusted=self._setup_trusted())
         except (SetupError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             self._send(HTTPStatus.BAD_REQUEST, json.dumps({"error": str(exc)}).encode(), "application/json")
             return
         self._send(HTTPStatus.OK, json.dumps(result).encode(), "application/json")
+
+    def _setup_discover(self) -> None:
+        """List the UniFi cameras on the LAN, or ask one typed address directly."""
+        setup = self.services.setup
+        assert setup is not None
+        try:
+            payload = self._setup_payload()
+            setup.check_token(self.headers.get("X-Setup-Token", ""), trusted=self._setup_trusted())
+            ip = payload.get("ip")
+            if ip is None or ip == "":
+                cameras = camera_finder.scan()
+            elif isinstance(ip, str):
+                try:
+                    address = str(ipaddress.IPv4Address(ip.strip()))
+                except ValueError:
+                    raise SetupError("camera IP address must be an IPv4 address") from None
+                found = camera_finder.probe(address)
+                cameras = [found] if found else []
+            else:
+                raise SetupError("camera IP address must be text")
+        except (SetupError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send(HTTPStatus.BAD_REQUEST, json.dumps({"error": str(exc)}).encode(), "application/json")
+            return
+        except OSError as exc:
+            self._send(HTTPStatus.SERVICE_UNAVAILABLE,
+                       json.dumps({"error": f"cannot scan the network: {exc}"}).encode(), "application/json")
+            return
+        self._send(HTTPStatus.OK, json.dumps({"cameras": cameras}).encode(), "application/json",
+                   headers=(("Cache-Control", "no-store"),))
 
     def _login_page(self, error: str = "", status: HTTPStatus = HTTPStatus.OK) -> None:
         if not self.services.auth.enabled:

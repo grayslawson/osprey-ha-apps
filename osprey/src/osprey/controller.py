@@ -276,6 +276,11 @@ class Session:
         return messages
 
 
+
+# Pushed by the camera when its day/night (IR-cut) state changes: {"scene": "DAY"|"NIGHT"}.
+SCENE_STATUS: Final = "EventIspSceneStatus"
+
+
 class Controller:
     """Accepts camera connections and runs the protocol over them."""
 
@@ -295,10 +300,12 @@ class Controller:
         configured_cameras: dict[str, dict[str, object]] | None = None,
         bind_host: str = "0.0.0.0",
         preset_store: PresetStore | None = None,
+        isp_baseline: dict[str, Any] | None = None,
         auto_home: bool = True,
         watchdog: PtzWatchdog | None = None,
         preset_ack_timeout: float = PRESET_ACK_TIMEOUT_SEC,
         arbiter: arbitration.Arbiter | None = None,
+        learned_peers: set[str] | None = None,
     ) -> None:
         self.cert = cert
         self.arbiter = arbiter or arbitration.Arbiter()
@@ -315,6 +322,8 @@ class Controller:
             normalise_mac(expected_camera_mac) if expected_camera_mac else None
         )
         self.bind_host = bind_host
+        # Shared with the ingest and snapshot servers: an accepted camera's IP joins it.
+        self.learned_peers = learned_peers
         self.configured_cameras = configured_cameras or {}
         self.cameras: dict[str, Camera] = {}
         self._sessions: dict[socket.socket, Session] = {}
@@ -328,6 +337,7 @@ class Controller:
         self.auto_home = auto_home
         self.watchdog = watchdog or PtzWatchdog()
         self.preset_ack_timeout = preset_ack_timeout
+        self.isp_baseline = dict(isp_baseline or {})
         self._presets_lock = threading.Lock()
         self._auto_home_checked: set[str] = set()
         self._presets_synced: set[str] = set()
@@ -473,6 +483,9 @@ class Controller:
             log.warning("rejected unregistered camera: mac=%s model=%s", mac, upgrade.camera_model)
             sock.close()
             return
+        if self.learned_peers is not None and peer[0] not in self.learned_peers:
+            log.info("adopted camera %s at %s: media and snapshot uploads now accepted from it", mac, peer[0])
+            self.learned_peers.add(peer[0])
         camera = self._camera_for(mac)
         registration = self.configured_cameras.get(mac)
         if registration is not None:
@@ -578,7 +591,7 @@ class Controller:
             return
         try:
             chunk = sock.recv(READ_SIZE)
-        except (TimeoutError,):
+        except TimeoutError:
             return
         except (OSError, ssl.SSLError):
             chunk = b""
@@ -625,6 +638,12 @@ class Controller:
         name = message.function_name
         if message.is_reply:
             self._resolve_ack(message)
+        if name == SCENE_STATUS:
+            scene = message.payload.get("scene")
+            camera = self.cameras.get(session.camera.mac)
+            if camera is not None and isinstance(scene, str):
+                camera.scene = scene.upper()
+                log.info("camera scene: %s mac=%s", camera.scene, camera.mac)
 
         if name == TIME_SYNC:
             # Answer EVERY timeSync, reply or not. The camera and controller
@@ -726,6 +745,7 @@ class Controller:
             if session.camera.is_ptz:
                 self._enable_ptz(session)
                 self._wait_for_ptz_callback(session.camera.mac, time.monotonic())
+                self._apply_isp_baseline(session.camera.mac)
             if not session.camera.adopted:
                 session.camera.adopted = True
                 log.info("adopted %s", session.camera.mac)
@@ -1249,6 +1269,24 @@ class Controller:
                 session.camera.motion.cancel()
                 return False
             return True
+
+    def _apply_isp_baseline(self, mac: str) -> None:
+        """Re-assert the configured ISP baseline on every (re)connect, off the control thread."""
+        if not self.isp_baseline:
+            return
+
+        def run() -> None:
+            acked = self.change_isp(mac, self.isp_baseline)
+            log.info("ISP baseline %s applied: acked=%s mac=%s", sorted(self.isp_baseline), acked, mac)
+
+        threading.Thread(target=run, name="isp-baseline", daemon=True).start()
+
+    def change_isp(self, mac: str, settings: dict[str, Any]) -> bool | None:
+        """Send ChangeIspSettings on the control channel (True ack, False refused, None silent)."""
+        session = self._control_session(mac)
+        if session is None:
+            return False
+        return self._request_acked(session, adoption.CHANGE_ISP, settings, timeout=3.0)
 
     @staticmethod
     def _free_slot(camera: Camera) -> int | None:

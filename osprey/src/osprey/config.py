@@ -128,6 +128,12 @@ def validate_ptz(value: Any) -> dict[str, Any]:
     users = out["autotrack_users"]
     if not isinstance(users, list) or not all(isinstance(u, str) and u.strip() for u in users):
         raise ValueError('"ptz.autotrack_users" must be a list of user names')
+    baseline = out["isp_baseline"]
+    if not isinstance(baseline, dict) or len(baseline) > 32 or not all(
+        re.fullmatch(r"[A-Za-z0-9]{1,40}", str(k)) and isinstance(v, (str, int, float, bool))
+        for k, v in baseline.items()
+    ):
+        raise ValueError('"ptz.isp_baseline" must be an object of simple ISP settings')
     presets_file = out["presets_file"]
     if presets_file is not None and (not isinstance(presets_file, str) or not presets_file.strip()):
         raise ValueError('"ptz.presets_file" must be a path or null')
@@ -156,7 +162,7 @@ def validate_runtime(value: dict[str, Any]) -> None:
         import ipaddress
         ipaddress.ip_address(bind.strip("[]"))
     except (ValueError, TypeError):
-        raise ValueError('"bind" must be an IP address')
+        raise ValueError('"bind" must be an IP address') from None
     if not isinstance(value.get("name"), str) or not value["name"].strip():
         raise ValueError('"name" must be a non-empty string')
     if not isinstance(value.get("announce"), bool):
@@ -265,7 +271,7 @@ def _sentry_points(value: Any, name: str) -> list[dict[str, Any]]:
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise ValueError(f'"{name}[{index}]" must be an object')
-        unknown = set(item) - {"name", "dwell_sec"}
+        unknown = set(item) - {"name", "dwell_sec", "night_preset"}
         if unknown:
             raise ValueError(
                 f'"{name}[{index}]" has unknown keys: {", ".join(sorted(unknown))}'
@@ -282,7 +288,13 @@ def _sentry_points(value: Any, name: str) -> list[dict[str, Any]]:
             None if dwell_raw is None
             else _sentry_number(dwell_raw, f'"{name}[{index}].dwell_sec"', 1.0, 86400.0)
         )
-        points.append({"name": point_name.strip(), "dwell_sec": dwell})
+        night = item.get("night_preset")
+        if night is not None and (not isinstance(night, str) or not night.strip()):
+            raise ValueError(f'"{name}[{index}].night_preset" must be a non-empty string')
+        points.append({
+            "name": point_name.strip(), "dwell_sec": dwell,
+            **({"night_preset": night.strip()} if night else {}),
+        })
     return points
 
 
@@ -421,6 +433,10 @@ DEFAULTS: Final[dict[str, Any]] = {
         # MQTT, a non-autotrack ONVIF user), autotracker commands are dropped for
         # this many seconds. 0 disables arbitration. See arbitration.py.
         "manual_hold_sec": 30.0,
+        # ChangeIspSettings fields re-sent whenever a PTZ camera (re)connects. hdr 1 fixed a
+        # persistent soft/defocused image at the preset zoom on a G5 PTZ whose Protect-set
+        # hdr was 2 (2026-11-23); {} sends nothing and leaves the camera's own ISP alone.
+        "isp_baseline": {"hdr": 1},
         # ONVIF users treated as autotrackers. Anonymous ONVIF is always one.
         "autotrack_users": ["frigate"],
     },

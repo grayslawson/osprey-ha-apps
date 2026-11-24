@@ -21,15 +21,15 @@ else:
 PY
 }
 
+# Empty: Osprey detects the host's LAN address and the setup wizard, opened
+# from the sidebar, asks to confirm it.
 HOST=$(get_option advertised_host)
-if [ -z "$HOST" ]; then
-  echo "Osprey: set advertised_host to the host/LAN address reachable by the camera" >&2
-  exit 1
-fi
 
 # Supervisor mounts /data root-owned at run time, so the state directory is
 # made here, as root, and the controller then runs as the unprivileged user.
 install -d -o osprey -g osprey -m 0750 /data/osprey
+# The wizard writes its configuration and generated secrets here.
+export OSPREY_CONFIG_FILE=/data/osprey/osprey.json
 
 # The sidebar console reaches Osprey through the Supervisor's ingress proxy,
 # which has this fixed address; Home Assistant has already signed that user in.
@@ -47,6 +47,24 @@ else
 fi
 unset PASSWORD
 
+# ONVIF and RTSP credentials. Left empty, a new install generates and logs them
+# once (stored in /data/osprey); an existing install stays anonymous until set.
+for SERVICE in ONVIF RTSP; do
+  LOWER=$(printf '%s' "$SERVICE" | tr '[:upper:]' '[:lower:]')
+  SECRET=$(get_option "${LOWER}_password")
+  USER_NAME=$(get_option "${LOWER}_username")
+  if [ -n "$SECRET" ]; then
+    (umask 077; printf '%s' "$SECRET" > "/data/osprey/${LOWER}-password")
+    chown osprey:osprey "/data/osprey/${LOWER}-password"
+    export "OSPREY_${SERVICE}_USERNAME=${USER_NAME:-osprey}"
+    export "OSPREY_${SERVICE}_PASSWORD_FILE=/data/osprey/${LOWER}-password"
+  fi
+done
+unset SECRET
+# auto: new installs are secure, existing ones keep their behaviour.
+SECURITY=$(get_option security)
+[ "$SECURITY" = "auto" ] || export OSPREY_SECURITY="$SECURITY"
+
 # Upgrade path: add-on builds before the rename kept the control certificate as
 # cuckoo.pem. The camera trusts that certificate, so keep using it.
 CERT=/data/osprey/osprey.pem
@@ -56,7 +74,6 @@ fi
 
 set -- /usr/bin/setpriv --reuid=osprey --regid=osprey --init-groups \
   python3 /opt/osprey/osprey/main.py \
-  --host "$HOST" \
   --cert "$CERT" \
   --name "$(get_option camera_name)" \
   --tracks "$(get_option tracks)" \
@@ -64,6 +81,7 @@ set -- /usr/bin/setpriv --reuid=osprey --regid=osprey --init-groups \
   --rtsp-port "$(get_option rtsp_port)" \
   --control-port 7442 --ingest-port 7550 --snapshot-port 7444
 
+[ -n "$HOST" ] && set -- "$@" --host "$HOST"
 CAMERA_IP=$(get_option camera_ip)
 CAMERA_MAC=$(get_option camera_mac)
 [ -n "$CAMERA_IP" ] && set -- "$@" --expected-camera-ip "$CAMERA_IP"

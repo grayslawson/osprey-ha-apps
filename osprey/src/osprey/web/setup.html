@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<link rel="icon" href="data:,">
+<title>Set up Osprey</title>
+<link rel="stylesheet" href="ui/tokens.css">
+<link rel="stylesheet" href="ui/setup.css">
+</head>
+<body>
+<main id="main">
+<h1>Set up Osprey</h1>
+<ol id="progress" class="progress" aria-label="Setup steps"></ol>
+<p id="error" class="note bad" role="alert" hidden></p>
+
+<section data-step="welcome" data-title="Start" hidden>
+  <p>This wizard connects one UniFi PTZ camera to Osprey and gets it ready for Frigate.</p>
+  <p class="note warn"><strong>Adopting a camera takes it away from UniFi Protect.</strong>
+    Protect stops managing it until you <a href="https://github.com/grayslawson/osprey/blob/main/docs/uninstall.md" target="_blank" rel="noopener">give it back</a>.</p>
+  <p id="welcome-status" class="muted" role="status">Checking the setup link&hellip;</p>
+  <div class="actions"><button type="button" data-next disabled>Start</button></div>
+</section>
+
+<section data-step="network" data-title="Osprey" hidden>
+  <form id="network-form">
+    <label>Address the camera and Frigate use to reach Osprey
+      <input name="host" required autocomplete="off" spellcheck="false"></label>
+    <p class="hint">Osprey found this address on the network interface that holds the default route.
+      With host networking (the default Compose file) it is the host's LAN address, and is usually right.</p>
+    <p id="bridge-hint" class="note warn" hidden>This looks like a container bridge address. In bridge networking
+      the camera cannot reach it: enter the host's LAN address instead.</p>
+    <label>Admin password for the Osprey console
+      <input name="admin_password" type="password" minlength="8" required autocomplete="new-password"></label>
+    <p class="hint">At least 8 characters. You sign in to the console with it.</p>
+    <div class="actions"><button type="submit">Next</button></div>
+  </form>
+</section>
+
+<section data-step="camera" data-title="Camera" hidden>
+  <p>Osprey looks for UniFi cameras on this network.</p>
+  <p id="scan-status" class="muted" role="status"></p>
+  <ul id="cameras" class="list" aria-label="Cameras found"></ul>
+  <div id="managed-help" class="note warn" hidden>
+    <p><strong>This camera is still managed by a controller, probably UniFi Protect.</strong>
+      Osprey can only adopt it with the password that controller set. To start fresh:</p>
+    <ol>
+      <li>In UniFi Protect, open the camera's settings and choose <strong>Remove</strong>.</li>
+      <li>Wait for the camera to restart. If it still shows as managed here, factory-reset it:
+        hold its reset button for about 10 seconds, until the LED flashes.</li>
+      <li>Wait two minutes for it to boot, then select <strong>Scan again</strong>.</li>
+    </ol>
+  </div>
+  <div class="actions"><button type="button" id="scan" class="secondary">Scan again</button></div>
+  <form id="camera-form">
+    <label>Camera IP address <input name="ip" required autocomplete="off" spellcheck="false" placeholder="192.0.2.20"></label>
+    <p class="hint">Not in the list? Type its address and select <strong>Look up</strong>. Reserve the address in your
+      router: Osprey accepts video only from it.</p>
+    <div class="actions"><button type="button" id="lookup" class="secondary">Look up</button></div>
+    <label>Camera MAC address <input name="mac" required autocomplete="off" spellcheck="false" placeholder="AA:BB:CC:DD:EE:FF"></label>
+    <label>Camera name <input name="name" required maxlength="64" value="G5 PTZ"></label>
+    <div class="actions"><button type="button" data-back class="secondary">Back</button><button type="submit">Save and restart Osprey</button></div>
+  </form>
+</section>
+
+<section data-step="saved" data-title="Restart" hidden>
+  <p id="saved-status" role="status">Saving&hellip;</p>
+  <div id="credentials" hidden>
+    <p>Osprey made these passwords for Frigate. They are shown once, so save them now.</p>
+    <pre id="credentials-text" class="code"></pre>
+  </div>
+  <div class="actions"><button type="button" id="saved-next" disabled>Next</button></div>
+</section>
+
+<section data-step="signin" data-title="" hidden>
+  <form id="signin-form">
+    <p>Sign in with the Osprey admin password to continue.</p>
+    <label>Admin password <input name="password" type="password" required autocomplete="current-password"></label>
+    <div class="actions"><button type="submit">Sign in</button></div>
+  </form>
+</section>
+
+<section data-step="adopt" data-title="Adopt" hidden>
+  <p>Osprey logs in to the camera at <strong id="adopt-ip"></strong> and points it at itself.</p>
+  <form id="adopt-form">
+    <label>Camera user <input name="username" value="ubnt" autocomplete="off"></label>
+    <label>Camera password <input name="password" type="password" value="ubnt" autocomplete="off"></label>
+    <p class="hint">A camera that was reset logs in with ubnt / ubnt.</p>
+    <div class="actions"><button type="submit">Adopt the camera</button></div>
+  </form>
+  <ul id="adopt-progress" class="list" aria-live="polite"></ul>
+  <div class="actions"><button type="button" id="adopt-next" disabled>Next</button></div>
+</section>
+
+<section data-step="frigate" data-title="Frigate" hidden>
+  <p>Add the camera to Frigate. Copy this block into Frigate's config, or let Osprey add it for you.</p>
+  <pre id="frigate-yaml" class="code"></pre>
+  <div class="actions"><button type="button" id="copy-yaml" class="secondary">Copy</button></div>
+  <p id="copy-status" class="hint" role="status"></p>
+  <form id="frigate-form">
+    <label>Frigate URL <input name="url" type="url" autocomplete="off" placeholder="http://frigate.lan:5000"></label>
+    <label>Camera name in Frigate <input name="name" autocomplete="off"></label>
+    <div id="frigate-login" hidden>
+      <p class="hint">This Frigate asks for a login. Use a Frigate admin account.</p>
+      <label>Frigate user <input name="username" autocomplete="off"></label>
+      <label>Frigate password <input name="password" type="password" autocomplete="off"></label>
+    </div>
+    <label id="frigate-tls" hidden><input type="checkbox" name="insecure_tls"> Trust Frigate's own self-signed certificate</label>
+    <div class="actions"><button type="submit" class="secondary">Preview the change</button></div>
+  </form>
+  <div id="frigate-preview" hidden>
+    <p>Osprey adds these lines to Frigate's config. It keeps a copy of the current config first.</p>
+    <pre id="frigate-diff" class="code diff"></pre>
+    <label><input type="checkbox" id="frigate-restart" checked> Restart Frigate so it loads the camera</label>
+    <div class="actions"><button type="button" id="frigate-apply">Add to Frigate</button></div>
+  </div>
+  <p id="frigate-result" role="status"></p>
+  <div class="actions"><button type="button" id="frigate-next">Next</button></div>
+</section>
+
+<section data-step="check" data-title="Check" hidden>
+  <p>Osprey checks the things Frigate needs.</p>
+  <ul id="checks" class="list" aria-live="polite"></ul>
+  <div class="actions"><button type="button" id="checks-run" class="secondary">Check again</button>
+    <button type="button" id="checks-next">Finish</button></div>
+</section>
+
+<section data-step="done" data-title="Done" hidden>
+  <p>Osprey is set up.</p>
+  <p class="hint">Keep Protect from adopting the camera again with
+    <a href="https://github.com/grayslawson/osprey/blob/main/docs/protect-guard.md" target="_blank" rel="noopener">Protect guard</a>.</p>
+  <div class="actions"><a class="button" href="./">Open the console</a></div>
+</section>
+</main>
+<script src="ui/setup.js"></script>
+</body>
+</html>
