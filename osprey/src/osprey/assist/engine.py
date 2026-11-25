@@ -20,7 +20,9 @@ from .config import AssistConfig
 from .decide import Decider, DiagnoseContext, JudgeContext
 from .detect import Baselines, Detector
 from .levers import GUARDS, TARGET, Lever, build_levers, candidates, next_value, ranges
+from .signals import Signals
 from .store import Store
+from .survey_run import SurveyService
 from .types import Action, Diagnosis, Finding, Metrics, Verdict
 
 log = logging.getLogger("osprey.assist")
@@ -55,13 +57,15 @@ class _Cam:
     last_check: float = 0.0
     last_arrival_check: dict[str, float] = field(default_factory=dict)
     reason: str = ""
+    survey: bool = False   # a survey owns the camera: quality checks wait
 
 
 class Engine:
     def __init__(self, cfg: AssistConfig, store: Store, cameras: dict[str, Camera], decider: Decider,
                  *, notifier: Any = None, clock: Callable[[], float] = time.time,
-                 sleep: Callable[[float], None] = time.sleep) -> None:
+                 sleep: Callable[[float], None] = time.sleep, signals: Signals | None = None) -> None:
         self.cfg, self.store, self.decider, self.notifier = cfg, store, decider, notifier
+        self.signals = signals
         self.clock, self.sleep = clock, sleep
         self.cams = {cid: _Cam(cid, cam) for cid, cam in cameras.items()}
         self.levers: dict[str, Lever] = build_levers(list(cfg.quality.levers), cfg.quality.limits)
@@ -70,6 +74,7 @@ class Engine:
         self._thread: threading.Thread | None = None
         self._last_cleanup = 0.0
         self.version = ""
+        self.survey = SurveyService(self)
 
     # ------------------------------------------------------------ settings
     @property
@@ -93,6 +98,7 @@ class Engine:
 
     def _kill(self) -> None:
         """Stop acting: release the patrol and put profile-driven settings back to their home values."""
+        self.survey.cancel()
         for cs in self.cams.values():
             with cs.lock:
                 try:
@@ -115,6 +121,7 @@ class Engine:
 
     def _run(self) -> None:
         self.reconcile()
+        self.survey.reconcile()
         while not self._stop.wait(POLL_SEC):
             for cs in self.cams.values():
                 try:
@@ -128,6 +135,7 @@ class Engine:
     def housekeeping(self) -> None:
         now = self.clock()
         self.expire_pending()
+        self.survey.housekeeping()
         if now - self._last_cleanup > 3600:
             self._last_cleanup = now
             s = self.cfg.storage
@@ -148,10 +156,15 @@ class Engine:
     # ---------------------------------------------------------------- tick
     def tick(self, cam_id: str) -> None:
         cs = self.cams[cam_id]
-        if not self.enabled or self.mode() == "off":
+        if not self.enabled or cs.survey or self.survey.busy:
             return
         with cs.lock:
             state = cs.camera.state()
+            here = (state.get("ptz") or {}).get("position")
+            if here:  # where the camera is, so a Frigate event can be placed on the survey map later
+                self.survey.db.log_position(cam_id, float(here["pan"]), float(here["tilt"]), float(here["zoom"]))
+            if self.mode() == "off":
+                return
             signals = state.get("assist_signals") or {}
             ptz = state.get("ptz") or {}
             now = self.clock()
@@ -198,7 +211,7 @@ class Engine:
         return "(free)"
 
     # ---------------------------------------------------------------- gate
-    def _gate(self, cs: _Cam, state: dict[str, Any], *, moves: bool = False) -> str | None:
+    def _gate(self, cs: _Cam, state: dict[str, Any], *, moves: bool = False, quiet: bool = True) -> str | None:
         """Why Assist must stand down right now, or None. Frigate and people always win."""
         sig = state.get("assist_signals") or {}
         age = sig.get("auto_active_age_sec")
@@ -211,7 +224,7 @@ class Engine:
             return f"the camera is in use ({owner})"
         if (state.get("ptz") or {}).get("status") not in ("IDLE", None) and moves:
             return "the camera is moving"
-        if moves and self._quiet():
+        if moves and quiet and self._quiet():
             return "quiet hours"
         return None
 
@@ -282,6 +295,8 @@ class Engine:
         mode = self.mode()
         if mode == "off":
             raise Refused("quality checks are off")
+        if self.survey.busy:
+            raise Refused("not now: a survey is running")
         with cs.lock:
             state = cs.camera.state()
             reason = self._gate(cs, state)
@@ -314,7 +329,10 @@ class Engine:
             rules = self._rules_diagnosis(cs, preset, scene, findings, night_presets)
             task = self.decider.tasks.get("quality.diagnose")
             diag = rules or Diagnosis("ok", 1.0, "rules")
-            if task is not None and task.mode != "rules":
+            by_model = self._by_signals(cs, preset, scene, rules, frame, night_presets) if self.signals is not None else None
+            if by_model is not None:
+                diag = by_model
+            elif task is not None and task.mode != "rules":
                 ctx = self._context(cs, preset, scene, metrics, z, findings, night_presets)
                 diag = self.decider.diagnose(ctx, rules, frame)
             if diag.problem in ("ok", "unknown") or diag.problem not in q.problems:
@@ -326,6 +344,36 @@ class Engine:
                 return self._record(cs, diag, preset, scene, trigger, metrics, frame, None, "observed",
                                     reason="muted after repeated 'not a problem' answers")
             return self._propose(cs, state, diag, preset, scene, trigger, metrics, frame, mode)
+
+    def _by_signals(self, cs: _Cam, preset: str, scene: str, rules: Diagnosis | None, frame: bytes,
+                    night_presets: set[str]) -> Diagnosis | None:
+        """Glare and blur from their own models, with the rules deciding exposure and noise.
+
+        None means no signal model answered, so the caller keeps the rules' view.
+        """
+        assert self.signals is not None
+        glare, blur = self.signals.glare(frame), self.signals.blur(frame)
+        if glare is None and blur is None:
+            return None
+        base = rules
+        if rules is not None and ((rules.problem == "glare" and glare is not None)
+                                  or (rules.problem == "blur" and blur is not None)):
+            base = None  # a model answered the question the rule was guessing at
+        hit = glare if glare is not None and glare.positive else None
+        problem = "glare"
+        if hit is None and blur is not None and blur.positive:
+            hit, problem = blur, "blur"
+        if hit is None:
+            return base or Diagnosis("ok", 1.0, "model")
+        ladder = self._ladder(cs, preset, scene, problem, night_presets)
+        picked = self.signals.action(frame)
+        if isinstance(picked, str):  # "none" or "wait": the action model sees nothing worth doing now
+            actions: tuple[Action, ...] = ()
+        else:
+            match = [a for a in ladder if picked is not None and a.lever == picked[0] and (a.change >= 0) == (picked[1] > 0)]
+            actions = tuple((match or list(ladder))[:1])
+        return Diagnosis(problem, hit.confidence, f"model:{hit.model}",
+                         f"{hit.model} says {problem} {hit.p:.2f} (needs {hit.threshold:g})", actions)
 
     def _scale(self, cs: _Cam, preset: str) -> dict[str, float]:
         return {p: float(self.store.get(f"scale:{cs.id}:{preset}:{p}", 1.0)) for p in ("blur", "glare", "under", "over", "noise")}
@@ -699,10 +747,14 @@ class Engine:
                 self.store.update_decision(row["id"], body={"verify_due": rest})
 
     def _judge(self, row: dict[str, Any], frame: bytes, m: Metrics) -> Verdict | None:
+        before = self.store.frame(row["before_frame"]) if row.get("before_frame") else None
+        if self.signals is not None and before is not None:
+            got = self.signals.judge(row["problem"], before, frame)
+            if got is not None:
+                return Verdict(got[0], got[1], "model", got[2])
         task = self.decider.tasks.get("quality.judge")
         if task is None or task.mode == "rules":
             return None
-        before = self.store.frame(row["before_frame"]) if row.get("before_frame") else None
         ctx = JudgeContext(row["preset"], row["scene"], row["problem"], TARGET[row["problem"]][0],
                            _metrics_from(row["metrics"]), m)
         return self.decider.judge(ctx, before, frame, None)
@@ -854,7 +906,7 @@ class Engine:
         return {
             "enabled": self.enabled, "version": self.version, "paused": not self.enabled, "cameras": cams,
             "capabilities": {c: {"mode": self.mode(c)} for c in self.cfg.modes},
-            "implemented": ["quality"], "pending": self.store.count_decisions("pending"),
+            "implemented": ["quality", "survey"], "survey": self.survey.status(first) if first else {}, "pending": self.store.count_decisions("pending"),
             "budgets": self.budgets(first) if first else {},
             "models": {"calls_today": self.store.calls_today(), "left": self._model_left()},
             "structural_in_auto": self.cfg.guardrails.structural_in_auto,
@@ -888,6 +940,7 @@ class Engine:
 
     def purge(self) -> None:
         self.store.purge()
+        self.survey.purge()
 
 
 def _metrics_from(raw: dict[str, Any]) -> Metrics:

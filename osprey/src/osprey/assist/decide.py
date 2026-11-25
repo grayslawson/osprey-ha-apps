@@ -4,27 +4,26 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Any
 
 from assist.providers import ChatProvider, DecisionsProvider, ModelReply, ProviderError
 from assist.types import DENY_LEVERS, GRID_W, Action, Diagnosis, Finding, Metrics, Verdict
+from third_party.raptor_vision.label import Labeller
+from third_party.raptor_vision.tasks import TaskConfig as _Task
+from third_party.raptor_vision.tasks import parse_task as _parse_task
 
-MODES = ("rules", "model", "both")
 DISAGREE = ("rules", "model", "log")
-_TASK_KEYS = {"mode", "provider", "model", "send_frames", "min_confidence", "on_disagree", "explain"}
 _PROBLEMS = ("glare", "blur", "under", "over", "noise")
 _ALL = (*_PROBLEMS, "ok", "unknown")
 _BETTER = ("before", "after", "same")
 
 
 @dataclass(frozen=True)
-class TaskConfig:
-    mode: str = "rules"
-    provider: str | None = None
-    model: str | None = None
-    send_frames: bool = False
-    min_confidence: float = 0.7
+class TaskConfig(_Task):
+    """raptor-vision's task settings plus the two Osprey-only keys. Mode, provider, model, send_frames, min_confidence,
+    threshold and fallback are the library's."""
+
     on_disagree: str = "log"
     explain: bool = False
 
@@ -32,29 +31,13 @@ class TaskConfig:
 def parse_task(name: str, raw: dict[str, Any]) -> TaskConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"task {name}: must be an object")
-    unknown = set(raw) - _TASK_KEYS
-    if unknown:
-        raise ValueError(f"task {name}: unknown key(s) {sorted(unknown)}")
-    mode = raw.get("mode", "rules")
-    if mode not in MODES:
-        raise ValueError(f"task {name}: mode must be one of {MODES}")
     od = raw.get("on_disagree", "log")
     if od not in DISAGREE:
         raise ValueError(f"task {name}: on_disagree must be one of {DISAGREE}")
-    mc = raw.get("min_confidence", 0.7)
-    if isinstance(mc, bool) or not isinstance(mc, (int, float)) or not 0 <= mc <= 1:
-        raise ValueError(f"task {name}: min_confidence must be 0..1")
-    for k in ("send_frames", "explain"):
-        if not isinstance(raw.get(k, False), bool):
-            raise ValueError(f"task {name}: {k} must be a boolean")
-    for k in ("provider", "model"):
-        v = raw.get(k)
-        if v is not None and (not isinstance(v, str) or not v):
-            raise ValueError(f"task {name}: {k} must be a non-empty string")
-    if mode != "rules" and not (raw.get("provider") and raw.get("model")):
-        raise ValueError(f"task {name}: mode {mode} needs provider and model")
-    return TaskConfig(mode, raw.get("provider"), raw.get("model"), raw.get("send_frames", False),
-                      float(mc), od, raw.get("explain", False))
+    if not isinstance(raw.get("explain", False), bool):
+        raise ValueError(f"task {name}: explain must be a boolean")
+    base = _parse_task(name, {k: v for k, v in raw.items() if k not in ("on_disagree", "explain")})
+    return TaskConfig(**{f.name: getattr(base, f.name) for f in fields(base)}, on_disagree=od, explain=raw.get("explain", False))
 
 
 @dataclass(frozen=True)
@@ -236,6 +219,39 @@ class Decider:
     @staticmethod
     def _frames(t: TaskConfig, p: ChatProvider | DecisionsProvider) -> bool:
         return p.cfg.allow_frames and t.send_frames
+
+    # ------------------------------------------------------------- generic
+    def available(self, name: str) -> bool:
+        """True when the task is set to use a model, and the provider may be sent frames if it needs them."""
+        tp = self._task(name)
+        return tp is not None and self._frames(*tp)
+
+    def calls_left(self, name: str) -> int:
+        tp = self._task(name)
+        return tp[1].budget.left if tp is not None else 0
+
+    def labeller(self, name: str, *, grid: tuple[int, int] | None = None, merge: bool = True, concurrency: int = 4,
+                 tap: Callable[[dict[str, Any]], None] | None = None) -> Labeller | None:
+        """A raptor-vision Labeller for a task, logging every call like ``_call`` does. None when the task has no model."""
+        tp = self._task(name)
+        if tp is None:
+            return None
+
+        def log(rec: dict[str, Any]) -> None:
+            self._log(rec)
+            if tap is not None:
+                tap(rec)
+
+        return Labeller(tp[0], tp[1], name=name, grid=grid, merge=merge, concurrency=concurrency, log=log)
+
+    def run(self, name: str, ask: Callable[[TaskConfig, ChatProvider | DecisionsProvider], ModelReply],
+            check: Callable[[TaskConfig, ChatProvider | DecisionsProvider, ModelReply], Any]) -> Any | None:
+        """One validated model call for a task of any capability. None when unavailable or on any failure."""
+        tp = self._task(name)
+        if tp is None or not self._frames(*tp):
+            return None
+        t, p = tp
+        return self._call(name, t, p, lambda: ask(t, p), lambda reply: check(t, p, reply))
 
     # ------------------------------------------------------------ diagnose
     def diagnose(self, ctx: DiagnoseContext, rules: Diagnosis | None, frame: bytes | None) -> Diagnosis:
