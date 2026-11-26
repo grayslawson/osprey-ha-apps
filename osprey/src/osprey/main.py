@@ -28,6 +28,7 @@ from pathlib import Path
 from types import FrameType
 from typing import Any, Final
 
+import adoption
 import arbitration
 import assist_scope
 import config
@@ -145,6 +146,8 @@ class Stack:
         self.ingest.start()
         self.uploads.start()
         self.stream.start()
+        # The RTSP listener is up before the ONVIF one, so /readyz can report it.
+        self.services.listeners.rtsp = True
         self.north.start()
         if self.read_only_north is not None:
             self.read_only_north.start()
@@ -193,16 +196,7 @@ def spec_to_tracks(spec: str) -> dict[str, str]:
 
 def tracks_to_model(tracks: dict[str, str]) -> tuple[tuple[str, ...], dict[str, Codec]]:
     """Turn a `{channel: codec}` map into the arm order and typed codecs."""
-    names: list[str] = []
-    codecs: dict[str, Codec] = {}
-    for name, codec in tracks.items():
-        names.append(name)
-        try:
-            codecs[name] = Codec(codec)
-        except ValueError:
-            log.warning("unknown codec %r for track %s; using h264", codec, name)
-            codecs[name] = Codec.H264
-    return tuple(names), codecs
+    return tuple(tracks), adoption.codec_map(tracks)
 
 
 def resolve_options(args: argparse.Namespace) -> Options:
@@ -775,7 +769,11 @@ def build(options: Options) -> Stack:
     interface_hw = (
         identity.interface_mac(options.discovery_interface) if options.discovery_interface else None
     )
+    # One shared holder, so a camera-scoped /readyz reports the same listeners
+    # as the primary one.
+    listeners = onvif.Listeners()
     northbound = {
+        "listeners": listeners,
         "identity": options.onvif_identity,
         "name": options.name,
         "interface_mac": interface_hw,
@@ -791,6 +789,7 @@ def build(options: Options) -> Stack:
         identity=options.onvif_identity, name=options.name,
         interface_mac=interface_hw, extra_scopes=options.discovery_scopes,
         autotrack_users=frozenset(options.ptz["autotrack_users"]),
+        listeners=listeners,
         log_calls=bool(options.onvif_log_calls),
     )
     north = onvif.OnvifServer(services, port=options.onvif_port, registry=registry, bind_host=options.bind_host)

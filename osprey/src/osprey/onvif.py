@@ -77,6 +77,7 @@ CONTROL_RECOVER_PATH: Final = "/control/ptz/recover"
 # Unauthenticated, read-only liveness for monitoring. It carries PTZ state and
 # counters only: no MAC, address, preset name, or credential.
 HEALTH_PATH: Final = "/healthz"
+READY_PATH: Final = "/readyz"
 _SNAPSHOT_KEY: Final = secrets.token_bytes(32)
 METRICS_PATH: Final = "/metrics"
 # An adopted camera with no video frame on any track for this long is degraded.
@@ -875,15 +876,42 @@ class Call:
             return default
         return element.attrib.get(attribute, default)
 
-    def vector(self, element_name: str) -> tuple[float, float] | None:
-        """PanTilt and Zoom arrive as x/y attributes on their own element."""
-        element = self.find(element_name)
+    def find_in(self, container: str, name: str) -> ElementTree.Element | None:
+        """The named element inside one container element.
+
+        A PTZ request carries a target and a speed, and both use the same
+        element names: a move may hold ``Translation/PanTilt`` and
+        ``Speed/PanTilt``.  Searching the whole body would let the speed
+        answer for the target, so every target lookup is scoped to the
+        container that holds it.
+        """
+        for element in self.body.iter():
+            if local_name(element.tag) != container:
+                continue
+            for child in element.iter():
+                if local_name(child.tag) == name:
+                    return child
+            return None
+        return None
+
+    def vector_in(self, container: str, name: str) -> tuple[float, float] | None:
+        """The x/y pair of an element inside one container element."""
+        element = self.find_in(container, name)
         if element is None:
             return None
         try:
             return float(element.attrib.get("x", "0")), float(element.attrib.get("y", "0"))
         except ValueError:
             return None
+
+    def attribute_in(
+        self, container: str, name: str, attribute: str, default: str = ""
+    ) -> str:
+        """An attribute of an element inside one container element."""
+        element = self.find_in(container, name)
+        if element is None:
+            return default
+        return element.attrib.get(attribute, default)
 
 
 def parse_call(payload: bytes) -> Call | None:
@@ -1027,6 +1055,19 @@ SNAPSHOT_TOKEN_PARAM: Final = "auth"
 # ---------------------------------------------------------------------- services
 
 
+@dataclass
+class Listeners:
+    """Which of the process listeners are bound.
+
+    Shared by every camera service so a camera-scoped ``/readyz`` reports the
+    same listener state as the primary one. The RTSP server is started before
+    the ONVIF server, so an ONVIF listener that can answer is itself proof
+    that the RTSP listener is bound.
+    """
+
+    rtsp: bool = False
+
+
 class Services:
     """Turns parsed calls into SOAP responses, using only the device model."""
 
@@ -1042,10 +1083,12 @@ class Services:
         snapshot_interval: float = 1.0,
         autotrack_users: frozenset[str] = frozenset({"frigate"}),
         persona: str = "",
+        listeners: Listeners | None = None,
         log_calls: bool = False) -> None:
         self.backend = backend
         self.host = host
         self.port = port
+        self.listeners = listeners if listeners is not None else Listeners()
         self.subscriptions = Subscriptions()
         self.started_at = time.time()
         self.auth = auth or AdminAuth()
@@ -1299,6 +1342,30 @@ class Services:
             degraded = True
         if degraded:
             body["status"] = "degraded"
+            return HTTPStatus.SERVICE_UNAVAILABLE, body
+        return HTTPStatus.OK, body
+
+    def ready(self) -> tuple[HTTPStatus, dict[str, object]]:
+        """Readiness for a probe or a load balancer: 200 once this can take work.
+
+        ``/healthz`` answers "is this usable right now"; this answers "can this
+        take work". Ready means the listeners are bound, the camera has been
+        adopted, and the camera is connected. The body names no camera, no
+        address, and no secret.
+        """
+        camera = self.backend.camera()
+        if camera is None:
+            return HTTPStatus.SERVICE_UNAVAILABLE, {"status": "waiting", "camera": False}
+        connected = self.backend.camera_connected()
+        body: dict[str, object] = {
+            "status": "ready",
+            "camera": True,
+            "camera_connected": connected,
+            "adopted": camera.adopted,
+            "rtsp": self.listeners.rtsp,
+        }
+        if not (camera.adopted and connected and self.listeners.rtsp):
+            body["status"] = "not ready"
             return HTTPStatus.SERVICE_UNAVAILABLE, body
         return HTTPStatus.OK, body
 
@@ -2474,8 +2541,13 @@ class Services:
 
     def _target_from(self, call: Call, camera: Camera, relative: bool) -> Position:
         current = camera.motion.position
-        pan_tilt = call.vector("PanTilt")
-        zoom = call.vector("Zoom")
+        # The target lives in Translation (RelativeMove) or Position
+        # (AbsoluteMove).  The Speed element carries the same PanTilt and Zoom
+        # names, so reading the whole body would let a velocity answer for the
+        # target and move an axis the client never asked to move.
+        container = "Translation" if relative else "Position"
+        pan_tilt = call.vector_in(container, "PanTilt")
+        zoom = call.vector_in(container, "Zoom")
         if pan_tilt is not None:
             # ONVIF's tilt axis is +Y = up; this camera's tilt value grows as the
             # head drops, so a raw mapping sends "up" down. Invert Y once here so
@@ -2487,7 +2559,7 @@ class Services:
             if relative:
                 span_pan = camera.pan_range.maximum - camera.pan_range.minimum
                 span_tilt = camera.tilt_range.maximum - camera.tilt_range.minimum
-                space = call.attribute("PanTilt", "space")
+                space = call.attribute_in(container, "PanTilt", "space")
                 if space == FOV_TRANSLATION_SPACE:
                     geometry = camera.field_of_view
                     if geometry is None:
@@ -2552,8 +2624,10 @@ class Services:
 
     def _continuous_step_from(self, call: Call, camera: Camera) -> tuple[Position, Position]:
         current = camera.motion.step_origin()
-        pan_tilt = call.vector("PanTilt")
-        zoom = call.vector("Zoom")
+        # A continuous move carries its target in Velocity; nothing else in the
+        # request may answer for it.
+        pan_tilt = call.vector_in("Velocity", "PanTilt")
+        zoom = call.vector_in("Velocity", "Zoom")
         if pan_tilt is not None:
             pan_tilt = (pan_tilt[0], -pan_tilt[1])
         pan_delta = 0
@@ -3086,6 +3160,10 @@ class _Handler(BaseHTTPRequestHandler):
         if root == HEALTH_PATH:
             status, health = self.services.health()
             self._send(status, json.dumps(health, separators=(",", ":")).encode(), "application/json")
+            return
+        if root == READY_PATH:
+            status, ready = self.services.ready()
+            self._send(status, json.dumps(ready, separators=(",", ":")).encode(), "application/json")
             return
         if root == METRICS_PATH:
             self._send(HTTPStatus.OK, self.services.metrics().encode(), "text/plain; version=0.0.4; charset=utf-8")
